@@ -26,7 +26,7 @@ def grid_triangulation(grid, subdivisions=1):
                         idx = [V.index(v) for v in vertices]
                         T.append([idx[0], idx[1], idx[2]])
                         T.append([idx[0], idx[2], idx[3]])
-    return np.array(V), np.array(T)
+    return np.array(V, dtype=np.float64), np.array(T)
 
 def plot_triangulation(V, T):
     triang = mtri.Triangulation(V[:,0], V[:,1], T)
@@ -35,23 +35,25 @@ def plot_triangulation(V, T):
     plt.gca().set_aspect('equal')
     plt.show()
 
-V, T = grid_triangulation(np.array(
-    [[0,0,0,0,0,0,0],
-     [0,1,1,1,1,0,0],
-     [0,1,1,1,1,1,0],
-     [0,0,0,1,1,1,0],
-     [0,0,0,0,0,1,0],
-     [0,0,0,0,0,0,0]]
-).T, 3)
-
-
 # V, T = grid_triangulation(np.array(
-#     [
-#      [0,1,1,1],
-#      [0,1,1,1],
-#      [0,1,1,1],
-#     ]
-# ).T)   
+#     [[0,0,0,0,0,0,0],
+#      [0,1,1,1,1,0,0],
+#      [0,1,1,1,1,1,0],
+#      [0,0,0,1,1,1,0],
+#      [0,0,0,0,0,1,0],
+#      [0,0,0,0,0,0,0]]
+# ).T, 3)
+
+
+V, T = grid_triangulation(np.array(
+    [
+     [0,0,0,0,0,0],
+     [0,1,1,1,1,1],
+     [0,0,0,0,0,0],
+     [0,0,0,0,0,0],
+    ]
+).T, 10)
+print("Vertices:\n", np.column_stack((np.arange(V.shape[0]), V)))
 
 def triangle_area(points):
     '''
@@ -66,13 +68,18 @@ def triangle_vector(points, index):
     :param index: Index of the vertex to compute the vector for (0, 1, or 2)
     :return: Vector perpendicular to the edge opposite to the vertex at index
     '''
-    v1, v2, v3 = points
+
     if index == 0:
-        return np.array([v2[1] - v3[1], v3[0] - v2[0]])
+        t, o1, o2 = points
     elif index == 1:
-        return np.array([v3[1] - v1[1], v1[0] - v3[0]])
+        o1, t, o2 = points
     elif index == 2:
-        return np.array([v1[1] - v2[1], v2[0] - v1[0]])
+        o1, o2, t = points
+
+    edge = o2 - o1
+    n_edge = edge / np.linalg.norm(edge)
+    o1_t = t - o1
+    return (n_edge.T @ o1_t)*n_edge - o1_t
 
 def construct_elasticity_matrix(E, nu):
     '''
@@ -102,7 +109,7 @@ def construct_stiffness_matrix(V, T, C, dirichlet):
                 t = triangle_vector(V[tri], test_i)
                 s = triangle_vector(V[tri], shape_i)
                 for coordinate in range(2):
-                    contraction = np.einsum('ijkl, j, k -> i', C, t, s)
+                    contraction = np.einsum('ijkl, j, l -> i', C, t, s)
                     entry = contraction[coordinate] * area / (t.T@t) / (s.T@s)
 
                     K[tri[test_i]*2 + coordinate, tri[shape_i]*2 + coordinate] += entry
@@ -115,12 +122,49 @@ def construct_stiffness_matrix(V, T, C, dirichlet):
 
     return K
 
-def construct_load_vector(V, T, load):
-    pass
+def construct_load_vector(V, B, neumann, body_force=None):
+    '''
+    :param V: List of vertices
+    :param B: List of boundaries (as indices into V)
+    :param neumann: List of tuples (boundary_index, traction) for Neumann boundary conditions
+    :param body_force: Function that takes a vertex and returns the body force vector at that vertex
+    :return: Load vector F
+    '''
+    F = np.zeros(len(V)*2)
+    
+    for boundary_index, force_vector in neumann:
+        v0 = V[B[boundary_index][0]]
+        v1 = V[B[boundary_index][1]]
+        length = np.linalg.norm(v1 - v0)
+        F[B[boundary_index][0]*2] += force_vector[0] * length / 2
+        F[B[boundary_index][0]*2+1] += force_vector[1] * length / 2
+        F[B[boundary_index][1]*2] += force_vector[0] * length / 2
+        F[B[boundary_index][1]*2+1] += force_vector[1] * length / 2
 
+    # implement body force contribution
+    if body_force is not None:
+        for i, vertex in enumerate(V):
+            bf = body_force(vertex)
+            F[i*2] += bf[0]
+            F[i*2+1] += bf[1]
+    return F
 
-C = construct_elasticity_matrix(200e9, 0.3)
-dirichlet = [(0, 0), (0, 1), (2, 0)]
+C = construct_elasticity_matrix(2e3, 0.3)
+dirichlet = [(1, 0), (1, 1), (3, 0)]
+
 K = construct_stiffness_matrix(V, T, C, dirichlet)
 invK = np.linalg.inv(K)
 
+# B = np.array([[63, 59], [59, 55], [55, 51], [51,47], [47,43], [43,39], [39,35], [35,31]])
+# force = np.array([0, -10000])
+# neumann = [(0, 1*force), (1, 0.9*force), (2, 0.8*force), (3, 0.7*force), (4, 0.6*force)]
+B = np.array([[560, 559], [559, 558], [558, 557], [557, 556], [556, 555], [555, 554], [554, 553], [553, 552], [552, 551], [551, 550]])
+force = np.array([0, 1000])
+# neumann = [(0, force), (1, force), (2, force), (3, force), (4, force), (5, force), (6, force), (7, force), (8, force), (9, force)]
+
+
+F = construct_load_vector(V, [], [], body_force=lambda v: np.array([0, -1]))
+u = invK @ F
+
+V = V.astype(np.float64) + u.reshape(-1, 2)
+plot_triangulation(V, T)
