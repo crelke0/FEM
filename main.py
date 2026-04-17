@@ -3,10 +3,6 @@ import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 import jax.numpy as jnp
 
-# Example data
-V = jnp.array([[0,0], [1,0], [1,1], [0,1]])
-T = jnp.array([[0,1,2], [0,2,3]])
-
 def grid_triangulation(grid, subdivisions=1):
     '''
     :param grid: Numpy NxM grid of 0s and 1s, where 1s represent the presence of a square
@@ -53,14 +49,14 @@ def plot_triangulation(V, T):
 V, T = grid_triangulation(jnp.array(
     [
      [0,0,0,0,0,0,0,0,0,0,0,0],
-     [0,0,0,0,0,0,0,0,0,1,1,1],
+     [0,0,0,0,0,0,0,0,0,0,0,0],
      [1,1,1,1,1,1,1,1,1,1,1,1],
      [1,1,1,1,1,1,1,1,1,1,1,1],
-     [1,1,1,0,0,0,0,0,0,0,1,1],
+     [1,1,0,0,0,0,0,0,0,1,1,1],
      [1,1,0,0,0,0,0,0,0,0,0,0],
      [0,0,0,0,0,0,0,0,0,0,0,0],
     ]
-)[::-1].T, 5)
+)[::-1].T, 3)
 
 
 def triangle_area(points):
@@ -151,28 +147,45 @@ def construct_orthotropic_elasticity(E1, E2, nu12, G12):
 
     return C
 
-def construct_stiffness_matrix(V, T, C, dirichlet):
+def rotate_elasticity_tensor(C, angle):
+    '''
+    Rotates the elasticity tensor by the given angle (in radians).
+    :param C: Elasticity tensor to rotate
+    :param angle: Rotation angle in radians
+    :return: Rotated elasticity tensor
+    '''
+    c = jnp.cos(angle)
+    s = jnp.sin(angle)
+    R = jnp.array([[c, -s], [s, c]])
+    return jnp.einsum('ia,jb,kc,ld,abcd->ijkl', R, R, R, R, C)
+
+def construct_stiffness_matrix(V, T, C, dirichlet, rots=None):
     '''
     :param V: List of vertices
     :param T: List of triangles (as indices into V)
-    :param C: Elasticity matrix
+    :param C: Elasticity tensor
+    :param rots: (optional) List of rotation angles for each triangle (in radians)
     :param dirichlet: List of tuples (vertex_index, coordinate_index) for Dirichlet boundary conditions
     :return: Stiffness matrix K
     '''
-    
-    def accumulate_K(K, tri):
+    def accumulate_K(i, K):
+        rot = rots[i] if rots is not None else 0
+        tri = T[i]
         area = triangle_area(V[tri])
         for shape_i in range(3):
             for test_i in range(3):
                 t = triangle_vector(V[tri], test_i)
                 s = triangle_vector(V[tri], shape_i)
+                rot_mat = jnp.array([[jnp.cos(rot), -jnp.sin(rot)], [jnp.sin(rot), jnp.cos(rot)]])
+                t = rot_mat @ t
+                s = rot_mat @ s
                 contraction = jnp.einsum('ijlk, j, k -> il', C, t, s)
                 entry = contraction * area / (t.T@t) / (s.T@s)
                 x, y = tri[test_i]*2, tri[shape_i]*2
                 update = jax.lax.dynamic_slice(K, (x,y), (2,2)) + entry[:2, :2]
                 K = jax.lax.dynamic_update_slice(K, update, (x,y))
-        return K, None
-    K, _ = jax.lax.scan(accumulate_K, jnp.zeros((len(V)*2, len(V)*2)), T)
+        return K
+    K = jax.lax.fori_loop(0, len(T), accumulate_K, jnp.zeros((len(V)*2, len(V)*2)))
 
     # Apply Dirichlet boundary conditions
     for vertex_index, coordinate_index in dirichlet:
@@ -235,13 +248,12 @@ for i in range(len(boundary_vertices)):
     dirichlet.append((boundary_vertices[i][0], 0))
     dirichlet.append((boundary_vertices[i][0], 1))
 
-C = construct_orthotropic_elasticity(4.0e5, 1.5e6, 0.30, 0.8e6)
+C = construct_orthotropic_elasticity(30.5e9,3.5e9,0.33,1.25e9)
+rots = jnp.array([3 for _ in range(len(T))])
 
-# dirichlet = [(1, 0), (1, 1), (3, 1)]
+K = construct_stiffness_matrix(V, T, C, dirichlet, rots=rots)
 
-K = construct_stiffness_matrix(V, T, C, dirichlet)
-
-F = construct_load_vector(V, T, [], dirichlet, [], body_force=lambda v: jnp.array([0,-100]))
+F = construct_load_vector(V, T, [], dirichlet, [], body_force=lambda v: jnp.array([0,-1000000]))
 
 u = jnp.linalg.solve(K, F)
 
