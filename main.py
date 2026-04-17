@@ -1,10 +1,11 @@
+import jax
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
-import numpy as np
+import jax.numpy as jnp
 
 # Example data
-V = np.array([[0,0], [1,0], [1,1], [0,1]])
-T = np.array([[0,1,2], [0,2,3]])
+V = jnp.array([[0,0], [1,0], [1,1], [0,1]])
+T = jnp.array([[0,1,2], [0,2,3]])
 
 def grid_triangulation(grid, subdivisions=1):
     '''
@@ -24,20 +25,22 @@ def grid_triangulation(grid, subdivisions=1):
                             if v not in V:
                                 V.append(v)
                         idx = [V.index(v) for v in vertices]
-                        # T.append([idx[0], idx[1], idx[2]])
-                        # T.append([idx[0], idx[2], idx[3]])
                         T.append([idx[0], idx[1], idx[3]])
                         T.append([idx[1], idx[2], idx[3]])
-    return np.array(V, dtype=np.float64), np.array(T)
+    V = jnp.array(V, dtype=jnp.float64)/subdivisions
+    return V, jnp.array(T, dtype=jnp.int32)
 
 def plot_triangulation(V, T):
+    import numpy
+    V = numpy.asarray(V)
+    T = numpy.asarray(T)
     triang = mtri.Triangulation(V[:,0], V[:,1], T)
 
     plt.triplot(triang)
     plt.gca().set_aspect('equal')
     plt.show()
 
-# V, T = grid_triangulation(np.array(
+# V, T = grid_triangulation(jnp.array(
 #     [[0,0,0,0,0,0,0],
 #      [0,1,1,1,1,0,0],
 #      [0,1,1,1,1,1,0],
@@ -47,13 +50,18 @@ def plot_triangulation(V, T):
 # ).T, 3)
 
 
-V, T = grid_triangulation(np.array(
+V, T = grid_triangulation(jnp.array(
     [
-     [0,0,0,0,0,0,0,0,0,0],
-     [1,1,1,1,1,1,1,1,1,1],
-     [0,0,0,0,0,0,0,0,0,0],
+     [0,0,0,0,0,0,0,0,0,0,0,0],
+     [0,0,0,0,0,0,0,0,0,1,1,1],
+     [1,1,1,1,1,1,1,1,1,1,1,1],
+     [1,1,1,1,1,1,1,1,1,1,1,1],
+     [1,1,1,0,0,0,0,0,0,0,1,1],
+     [1,1,0,0,0,0,0,0,0,0,0,0],
+     [0,0,0,0,0,0,0,0,0,0,0,0],
     ]
-)[::-1].T, 10)
+)[::-1].T, 5)
+
 
 def triangle_area(points):
     '''
@@ -77,7 +85,7 @@ def triangle_vector(points, index):
         o1, o2, t = points
 
     edge = o2 - o1
-    n_edge = edge / np.linalg.norm(edge)
+    n_edge = edge / jnp.linalg.norm(edge)
     o1_t = t - o1
     return (n_edge.T @ o1_t)*n_edge - o1_t
 
@@ -87,25 +95,60 @@ def construct_elasticity_matrix(E, nu):
     :param nu: Poisson's ratio
     :return: Elasticity matrix C
     '''
-    # C = np.zeros((2,2,2,2))
-    # C[0,0,0,0] = C[1,1,1,1] = E / (1 - nu**2)
-    # C[0,0,1,1] = C[1,1,0,0] = E * nu / (1 - nu**2)
-    # C[0,1,0,1] = C[1,0,1,0] = E / (2 * (1 + nu))
-    # return C
-    C = np.zeros((2,2,2,2), dtype=float)
+    C = jnp.zeros((2,2,2,2), dtype=float)
     A = E/(1-nu**2)
     mu = E/(2*(1+nu))
 
-    C[0,0,0,0] = A
-    C[1,1,1,1] = A
-    C[0,0,1,1] = A*nu
-    C[1,1,0,0] = A*nu
+    C = C.at[0,0,0,0].set(A)
+    C = C.at[1,1,1,1].set(A)
+    C = C.at[0,0,1,1].set(A*nu)
+    C = C.at[1,1,0,0].set(A*nu)
 
     # all shear minor-symmetry entries:
-    C[0,1,0,1] = mu
-    C[0,1,1,0] = mu
-    C[1,0,0,1] = mu
-    C[1,0,1,0] = mu
+    C = C.at[0,1,0,1].set(mu)
+    C = C.at[0,1,1,0].set(mu)
+    C = C.at[1,0,0,1].set(mu)
+    C = C.at[1,0,1,0].set(mu)
+    return C
+
+def construct_orthotropic_elasticity(E1, E2, nu12, G12):
+    """
+    2D orthotropic elasticity tensor C[i,j,k,l] for plane stress.
+    Material axes are aligned with x,y.
+
+    Ijnputs:
+      E1, E2   : Young's moduli along x(=1) and y(=2)
+      nu12     : Poisson ratio (strain in 2 due to stress in 1)
+      G12      : shear modulus in the 1-2 plane
+
+    Returns:
+      C : (2,2,2,2) tensor with minor symmetries, such that sigma = C : eps
+          where eps is the standard symmetric strain tensor.
+    """
+    C = jnp.zeros((2, 2, 2, 2), dtype=float)
+
+    nu21 = nu12 * E2 / E1
+    denom = 1.0 - nu12 * nu21
+    if denom <= 0:
+        raise ValueError("Invalid parameters: 1 - nu12*nu21 must be > 0 for stability (plane stress).")
+
+    # Normal stiffnesses (plane stress orthotropic)
+    Q11 = E1 / denom
+    Q22 = E2 / denom
+    Q12 = nu12 * E2 / denom  # equals nu21 * E1 / denom
+
+    # Fill tensor entries (i,j,k,l in {0,1} correspond to {1,2})
+    C = C.at[0, 0, 0, 0].set(Q11)
+    C = C.at[1, 1, 1, 1].set(Q22)
+    C = C.at[0, 0, 1, 1].set(Q12)
+    C = C.at[1, 1, 0, 0].set(Q12)
+
+    # Shear: sigma12 = 2*G12*eps12 because eps12=eps21 and C1212=C1221=...
+    C = C.at[0, 1, 0, 1].set(G12)
+    C = C.at[0, 1, 1, 0].set(G12)
+    C = C.at[1, 0, 0, 1].set(G12)
+    C = C.at[1, 0, 1, 0].set(G12)
+
     return C
 
 def construct_stiffness_matrix(V, T, C, dirichlet):
@@ -116,27 +159,26 @@ def construct_stiffness_matrix(V, T, C, dirichlet):
     :param dirichlet: List of tuples (vertex_index, coordinate_index) for Dirichlet boundary conditions
     :return: Stiffness matrix K
     '''
-    K = np.zeros((len(V)*2, len(V)*2))
-    for tri in T:
+    
+    def accumulate_K(K, tri):
         area = triangle_area(V[tri])
         for shape_i in range(3):
             for test_i in range(3):
                 t = triangle_vector(V[tri], test_i)
                 s = triangle_vector(V[tri], shape_i)
-                # for coordinate in range(2):
-                for x in range(2):
-                    for y in range(2):
-                        contraction = np.einsum('ijlk, j, k -> il', C, t, s)
-                        entry = contraction[x, y] * area / (t.T@t) / (s.T@s)
-
-                        K[tri[test_i]*2 + x, tri[shape_i]*2 + y] += entry
+                contraction = jnp.einsum('ijlk, j, k -> il', C, t, s)
+                entry = contraction * area / (t.T@t) / (s.T@s)
+                x, y = tri[test_i]*2, tri[shape_i]*2
+                update = jax.lax.dynamic_slice(K, (x,y), (2,2)) + entry[:2, :2]
+                K = jax.lax.dynamic_update_slice(K, update, (x,y))
+        return K, None
+    K, _ = jax.lax.scan(accumulate_K, jnp.zeros((len(V)*2, len(V)*2)), T)
 
     # Apply Dirichlet boundary conditions
     for vertex_index, coordinate_index in dirichlet:
-        K[vertex_index*2 + coordinate_index, :] = 0
-        K[:, vertex_index*2 + coordinate_index] = 0
-        K[vertex_index*2 + coordinate_index, vertex_index*2 + coordinate_index] = 1
-
+        K = K.at[vertex_index*2 + coordinate_index, :].set(0)
+        K = K.at[:, vertex_index*2 + coordinate_index].set(0)
+        K = K.at[vertex_index*2 + coordinate_index, vertex_index*2 + coordinate_index].set(1)
     return K
 
 def construct_load_vector(V, T, B, dirichlet, neumann, body_force=None):
@@ -149,31 +191,33 @@ def construct_load_vector(V, T, B, dirichlet, neumann, body_force=None):
     :param body_force: Function that takes a vertex and returns the body force vector at that vertex
     :return: Load vector F
     '''
-    F = np.zeros(len(V)*2)
+    F = jnp.zeros(len(V)*2)
     
     # Implement Neumann boundary conditions
     for boundary_index, force_vector in neumann:
         v0 = V[B[boundary_index][0]]
         v1 = V[B[boundary_index][1]]
-        length = np.linalg.norm(v1 - v0)
+        length = jnp.linalg.norm(v1 - v0)
         F[B[boundary_index][0]*2] += force_vector[0] * length / 2
         F[B[boundary_index][0]*2+1] += force_vector[1] * length / 2
         F[B[boundary_index][1]*2] += force_vector[0] * length / 2
         F[B[boundary_index][1]*2+1] += force_vector[1] * length / 2
 
     # Implement body force contribution
+    def accumulate_F(F, tri):
+         area = triangle_area(V[tri])
+         for vertex_index in tri:
+             force = body_force(V[vertex_index])
+             F = F.at[vertex_index*2].add(force[0] * area / 3)
+             F = F.at[vertex_index*2+1].add(force[1] * area / 3)
+         return F, None
+    
     if body_force is not None:
-        for tri in T:
-            area = triangle_area(V[tri])
-            for vertex_index in tri:
-                force = body_force(V[vertex_index])
-                F[vertex_index*2] += force[0] * area / 3
-                F[vertex_index*2+1] += force[1] * area / 3
-
+        F, _ = jax.lax.scan(accumulate_F, F, T)
             
     # Fix Dirichlet loadings
     for vertex_index, coordinate_index in dirichlet:
-        F[vertex_index*2 + coordinate_index] = 0
+        F = F.at[vertex_index*2 + coordinate_index].set(0)
     return F
 
 
@@ -191,22 +235,15 @@ for i in range(len(boundary_vertices)):
     dirichlet.append((boundary_vertices[i][0], 0))
     dirichlet.append((boundary_vertices[i][0], 1))
 
-C = construct_elasticity_matrix(2e5, 0.3)
+C = construct_orthotropic_elasticity(4.0e5, 1.5e6, 0.30, 0.8e6)
+
 # dirichlet = [(1, 0), (1, 1), (3, 1)]
 
 K = construct_stiffness_matrix(V, T, C, dirichlet)
-invK = np.linalg.inv(K)
 
-# B = np.array([[63, 59], [59, 55], [55, 51], [51,47], [47,43], [43,39], [39,35], [35,31]])
-# force = np.array([0, -10000])
-# neumann = [(0, 1*force), (1, 0.9*force), (2, 0.8*force), (3, 0.7*force), (4, 0.6*force)]
-# B = np.array([[560, 559], [559, 558], [558, 557], [557, 556], [556, 555], [555, 554], [554, 553], [553, 552], [552, 551], [551, 550]])
-# force = np.array([0, 1000])
-# neumann = [(0, force), (1, force), (2, force), (3, force), (4, force), (5, force), (6, force), (7, force), (8, force), (9, force)]
+F = construct_load_vector(V, T, [], dirichlet, [], body_force=lambda v: jnp.array([0,-100]))
 
-
-F = construct_load_vector(V, T, [], dirichlet, [], body_force=lambda v: np.array([0,-2]))
-u = invK @ F
+u = jnp.linalg.solve(K, F)
 
 V += u.reshape(-1, 2)
 plot_triangulation(V, T)
