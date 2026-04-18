@@ -26,14 +26,23 @@ def grid_triangulation(grid, subdivisions=1):
     V = jnp.array(V, dtype=jnp.float64)/subdivisions
     return V, jnp.array(T, dtype=jnp.int32)
 
-def plot_triangulation(V, T):
-    import numpy
-    V = numpy.asarray(V)
-    T = numpy.asarray(T)
-    triang = mtri.Triangulation(V[:,0], V[:,1], T)
+def plot_triangulation(V, T, rotation):
+    # V = jnp.asarray(V)
+    # T = jnp.asarray(T)
+    # rotation = np.asarray(rotation)
 
-    plt.triplot(triang)
-    plt.gca().set_aspect('equal')
+    triang = mtri.Triangulation(V[:, 0], V[:, 1], T)
+
+    plt.figure()
+    plt.tripcolor(
+        triang,
+        facecolors=rotation,
+        cmap="twilight",   # good for angles (circular)
+        edgecolors="k"
+    )
+
+    plt.gca().set_aspect("equal")
+    plt.colorbar(label="rotation (rad)")
     plt.show()
 
 # V, T = grid_triangulation(jnp.array(
@@ -52,9 +61,9 @@ V, T = grid_triangulation(jnp.array(
      [0,0,0,0,0,0,0,0,0,0,0,0],
      [1,1,1,1,1,1,1,1,1,1,1,1],
      [1,1,1,1,1,1,1,1,1,1,1,1],
-     [1,1,0,0,0,0,0,0,0,1,1,1],
-     [1,1,0,0,0,0,0,0,0,0,0,0],
-     [0,0,0,0,0,0,0,0,0,0,0,0],
+     [0,0,1,1,0,0,0,0,1,1,0,0],
+     [0,0,1,1,0,0,0,0,1,1,0,0],
+     [0,0,1,1,0,0,0,0,1,1,0,0],
     ]
 )[::-1].T, 3)
 
@@ -176,15 +185,17 @@ def construct_stiffness_matrix(V, T, C, dirichlet, rots=None):
             for test_i in range(3):
                 t = triangle_vector(V[tri], test_i)
                 s = triangle_vector(V[tri], shape_i)
-                rot_mat = jnp.array([[jnp.cos(rot), -jnp.sin(rot)], [jnp.sin(rot), jnp.cos(rot)]])
+                rot_mat = jnp.array([[jnp.cos(-rot), -jnp.sin(-rot)], [jnp.sin(-rot), jnp.cos(-rot)]])
                 t = rot_mat @ t
                 s = rot_mat @ s
-                contraction = jnp.einsum('ijlk, j, k -> il', C, t, s)
+                contraction = jnp.einsum('ijkl, j, l -> ik', C, t, s)
+
                 entry = contraction * area / (t.T@t) / (s.T@s)
                 x, y = tri[test_i]*2, tri[shape_i]*2
                 update = jax.lax.dynamic_slice(K, (x,y), (2,2)) + entry[:2, :2]
                 K = jax.lax.dynamic_update_slice(K, update, (x,y))
         return K
+    
     K = jax.lax.fori_loop(0, len(T), accumulate_K, jnp.zeros((len(V)*2, len(V)*2)))
 
     # Apply Dirichlet boundary conditions
@@ -233,13 +244,45 @@ def construct_load_vector(V, T, B, dirichlet, neumann, body_force=None):
         F = F.at[vertex_index*2 + coordinate_index].set(0)
     return F
 
+def compute_stresses(u, V, T, rots=None):
+    '''
+    :param u: Displacement vectors shape (len(V), 2)
+    :param V: List of vertices
+    :param T: List of triangles (as indices into V)
+    :param rots: (optional) List of rotation angles for each triangle (in radians)
+    :return: List of stress tensors for each triangle
+    '''
+    rots = rots if rots is not None else jnp.zeros(len(T))
+    def compute_triange_stress(tri, rot):
+        grad = jnp.zeros((2,2))
+        for vertex in range(3):
+            s = triangle_vector(V[tri], vertex)
+            rot_mat = jnp.array([[jnp.cos(-rot), -jnp.sin(-rot)], [jnp.sin(-rot), jnp.cos(-rot)]])
+            s = rot_mat @ s
+            grad = grad + jnp.einsum('i, j -> ij', s, u[tri[vertex]])
+        strain = 0.5 * (grad + grad.T)
+        stress = jnp.einsum('ijkl, kl->ij', C, strain)
+        return stress
+    triangle_stresses = jax.vmap(compute_triange_stress)(T, rots)
+    
+    return triangle_stresses
+
+def von_mises_stresses(stress):
+    '''
+    :param stress: Stress tensor shape (2,2)
+    :return: Von Mises stress scalar
+    '''
+    sxx = stress[0, 0]
+    sxy = stress[0, 1]
+    syy = stress[1, 1]
+    return jnp.sqrt(sxx**2 - sxx*syy + syy**2 + 3*sxy**2)
 
 boundary_vertices = []
 for i in range(V.shape[0]):
-    if V[i, 0] == 0:
+    if V[i, 1] == 0:
         j = 0
         for j in range(len(boundary_vertices)):
-            if boundary_vertices[j][1][1] < V[i, 1]:
+            if boundary_vertices[j][1][1] < V[i, 0]:
                 break
         boundary_vertices.insert(j, (i, V[i]))
 
@@ -247,15 +290,38 @@ dirichlet = []
 for i in range(len(boundary_vertices)):
     dirichlet.append((boundary_vertices[i][0], 0))
     dirichlet.append((boundary_vertices[i][0], 1))
+print("Dirichlet vertices: ", [V[i] for i, _ in dirichlet])
 
 C = construct_orthotropic_elasticity(30.5e9,3.5e9,0.33,1.25e9)
-rots = jnp.array([3 for _ in range(len(T))])
+
+
+rots = jnp.array([0 for _ in range(len(T))], dtype=jnp.float64)
+
+F = construct_load_vector(V, T, [], dirichlet, [], body_force=lambda v: jnp.array([0,-100000000*jnp.exp(-5*(v[0]-6)**2)]))
+
+def softmax_max(vm_stresses, beta):
+    m = jnp.max(vm_stresses)
+    return m + jnp.log(jnp.sum(jnp.exp(beta * (vm_stresses - m)))) / beta
+
+
+def forward(rots):
+    K = construct_stiffness_matrix(V, T, C, dirichlet, rots=rots)
+
+    u = jnp.linalg.solve(K, F)
+    u = u.reshape(-1, 2)
+    stresses = compute_stresses(u, V, T, rots=rots)
+    vm_stresses = jax.vmap(von_mises_stresses)(stresses)
+    loss = softmax_max(vm_stresses, beta=10)
+    print("Loss: ", loss)
+    return loss
+for _ in range(10):
+    gradient = jax.grad(forward)(rots)
+    rots = rots - 0.1 * gradient
 
 K = construct_stiffness_matrix(V, T, C, dirichlet, rots=rots)
 
-F = construct_load_vector(V, T, [], dirichlet, [], body_force=lambda v: jnp.array([0,-1000000]))
-
 u = jnp.linalg.solve(K, F)
+u = u.reshape(-1, 2)
 
-V += u.reshape(-1, 2)
-plot_triangulation(V, T)
+V += u
+plot_triangulation(V, T, rots)
