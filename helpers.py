@@ -92,10 +92,8 @@ def generate_mesh_dual(V, T):
     centroids = jnp.mean(V[T], axis=1)
     adjacency_list = []
     for tri in T:
-        adjacent_tris = []
         mask = jnp.isin(T, tri).sum(axis=1) == 2
-        adjacent_tris = jnp.linspace(0, len(T)-1, len(T), dtype=jnp.int32)[mask]
-        adjacency_list.append(adjacent_tris)
+        adjacency_list.append(mask.nonzero()[0])
     return centroids, adjacency_list
 
 def triangle_quality(points):
@@ -192,31 +190,62 @@ def plot_primal_dual(V, T, C, A):
     plt.gca().set_aspect("equal")
     plt.show()
 
-def generate_mesh(key=jax.random.PRNGKey(0)):
+def generate_mesh(key=jax.random.PRNGKey(3)):
     """
     Generate a random mesh. 
-    Note: not all grid points are in triangles, and it's technically possible to have multiple disjoint meshes.
-    Fixing these is not worth the overhead.
     :param key: JAX random key for reproducibility
     :return: V, T where V is a list of vertices and T is a list of triangles (as indices into V)
     """
+
     W = 9
     H = 9
     key, subkey = jax.random.split(key)
     grid = jittered_grid((15, 15), (W, H), key=subkey)
+    tris = jnp.array(mtri.Triangulation(grid[:, 0], grid[:, 1]).triangles, dtype=jnp.int32)
 
     # mask out certain grid points to create a more interesting shape
     angles = jnp.arctan2(grid[:, 1] - W/2, grid[:, 0] - H/2)
     key, subkey = jax.random.split(key)
-    grid_mask = jax.vmap(fourier_noise(5, key=subkey))(angles)*2+4 > jnp.linalg.norm(grid-jnp.array([W/2, H/2]), axis=-1)
+    grid_mask = jax.vmap(fourier_noise(5, key=subkey))(angles)*W/3+W/2 > jnp.linalg.norm(grid-jnp.array([W/2, H/2]), axis=-1)
     
-    # filter out the tirangles that contain masked out points
-    triang = mtri.Triangulation(grid[:, 0], grid[:, 1]).triangles
-    triang_mask = jax.vmap(lambda T: jnp.all(grid_mask[T]))(triang)
-    filtered_triang = triang[triang_mask]
+    tris_mask = jax.vmap(lambda T: jnp.all(grid_mask[T]))(tris) # filter out the triangles that contain masked out points
+    tris_mask = tris_mask & jax.vmap(lambda T: triangle_quality(grid[T])>0.5)(tris) # filter out the trianlges that are close to degenerate
 
-    # filter out the trianlges that are close to degenerate
-    triang_mask = jax.vmap(lambda T: triangle_quality(grid[T])>0.5)(filtered_triang)
-    filtered_triang = filtered_triang[triang_mask]
+    tris = tris[tris_mask]
 
-    return grid, filtered_triang
+    # Flood fill to remove disjoint pieces and reindex vertices
+
+    _, adjacency_list = generate_mesh_dual(grid, tris)
+
+    vertex_indices = jnp.full(len(grid), -1, dtype=jnp.int32)
+    vertex_indices_inverse = jnp.full(len(grid), -1, dtype=jnp.int32)
+    final_tris_mask = jnp.zeros(len(tris), dtype=bool)
+    
+    next_vertex_index = 0
+    open_tris = [jnp.argmax(tris_mask)]
+    while len(open_tris) > 0:
+        i = open_tris.pop()
+        if final_tris_mask[i]:
+            continue
+
+        for v in tris[i]:
+            if vertex_indices[v] == -1:
+                vertex_indices = vertex_indices.at[v].set(next_vertex_index)
+                vertex_indices_inverse = vertex_indices_inverse.at[next_vertex_index].set(v)
+                next_vertex_index += 1
+        tris = tris.at[i].set(vertex_indices[tris[i]])
+        
+        for adj in adjacency_list[i]:
+            if not final_tris_mask[adj]:
+                open_tris.append(adj)
+        
+        final_tris_mask = final_tris_mask.at[i].set(True)
+
+    V = grid[vertex_indices_inverse[vertex_indices_inverse != -1]]
+    T = tris[final_tris_mask]
+
+    return V, T
+
+V, T = generate_mesh()
+centroids, adjacency_list = generate_mesh_dual(V, T)
+plot_primal_dual(V, T, centroids, adjacency_list)
