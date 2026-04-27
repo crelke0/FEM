@@ -50,7 +50,7 @@ C = fem.construct_orthotropic_elasticity(
 
 rots = jnp.array([0 for _ in range(len(T))], dtype=jnp.float64)
 
-F = fem.construct_load_vector(V, T, [], dirichlet, [], body_force=lambda v: jnp.array([0,-40*jnp.exp(-(v[0]-2)**2)]))
+F = fem.construct_load_vector(V, T, [], dirichlet, [], body_force=lambda v: jnp.array([0,-60*jnp.exp(-(v[0]-20)**2)]))
 
 
 @jax.jit
@@ -73,5 +73,5 @@ K = fem.construct_stiffness_matrix(V, T, C, dirichlet, rots=rots)
 u = jnp.linalg.solve(K, F)
 u = u.reshape(-1, 2)
 
-# V += u
+V += u
 helpers.plot_triangulation_with_angle(V, T, rots)

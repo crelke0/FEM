@@ -59,6 +59,18 @@ def triangle_area(points):
     v1, v2, v3 = points
     return 0.5 * abs(v1[0]*(v2[1]-v3[1]) + v2[0]*(v3[1]-v1[1]) + v3[0]*(v1[1]-v2[1]))
 
+def point_in_triangle(pt, tri):
+    '''
+    :param pt: Point to test
+    :param tri: List of 3 vertices of the triangle
+    :return: True if pt is inside the triangle defined by tri, False otherwise
+    '''
+    A = triangle_area(tri)
+    A1 = triangle_area([pt, tri[1], tri[2]])
+    A2 = triangle_area([tri[0], pt, tri[2]])
+    A3 = triangle_area([tri[0], tri[1], pt])
+    return jnp.isclose(A, A1 + A2 + A3)
+
 def triangle_vector(points, index):
     '''
     :param points: List of 3 vertices of the triangle
@@ -87,14 +99,23 @@ def generate_mesh_dual(V, T):
     """
     :param V: List of vertices
     :param T: List of triangles (as indices into V)
-    :return: centroids, adjacency_list where centroids is a list of triangle centroids and adjacency_list is a list of lists of adjacent triangle indices
+    :return: centroids, edges, adjacency_list where centroids is a list of triangle centroids, edges is a JAX list of edges, and adjacency_list is a jagged python list of lists of adjacent triangle indices
     """
     centroids = jnp.mean(V[T], axis=1)
-    adjacency_list = []
-    for tri in T:
+    src = []
+    adj = []
+    for i in range(T.shape[0]):
+        tri = T[i]
         mask = jnp.isin(T, tri).sum(axis=1) == 2
-        adjacency_list.append(mask.nonzero()[0])
-    return centroids, adjacency_list
+        indices = mask.nonzero()[0]
+
+        src.append(jnp.full_like(indices, i))
+        adj.append(indices)
+    src = jnp.concatenate(src)
+    dest = jnp.concatenate(adj)  
+    edges = jnp.stack([src, dest], axis=1)
+
+    return centroids, edges, adj
 
 def triangle_quality(points):
     """
@@ -161,7 +182,7 @@ def fourier_noise(frequency_count, key=jax.random.PRNGKey(0)):
         return jnp.sum(amplitudes * jnp.sin(frequencies * angle))
     return noise
 
-def plot_primal_dual(V, T, C, A):
+def plot_primal_dual(V, T, C, E):
     # temporary chat gpt function
     tri = mtri.Triangulation(V[:, 0], V[:, 1], T)
 
@@ -176,31 +197,84 @@ def plot_primal_dual(V, T, C, A):
     # --- dual nodes (centroids) ---
     plt.scatter(C[:, 0], C[:, 1], s=12, color="red")
 
-    # --- dual edges (from adjacency list) ---
-    for i, neighbors in enumerate(A):
-        for j in neighbors:
-            # avoid double drawing if undirected
-            if j > i:
-                p0 = C[i]
-                p1 = C[j]
-                plt.plot([p0[0], p1[0]],
-                         [p0[1], p1[1]],
-                         color="red", linewidth=1, alpha=0.6)
+    # --- dual edges ---
+    for edge in E:
+        i, j = edge
+        # avoid double drawing if undirected
+        if j > i:
+            p0 = C[i]
+            p1 = C[j]
+            plt.plot([p0[0], p1[0]],
+                        [p0[1], p1[1]],
+                        color="red", linewidth=1, alpha=0.6)
 
     plt.gca().set_aspect("equal")
     plt.show()
 
-def generate_mesh(key=jax.random.PRNGKey(3)):
+from matplotlib.path import Path
+
+def plot_model_contours_on_mesh(model_apply, params, V, T, res=200, levels=8):
+    V = jnp.asarray(V)
+    T = jnp.asarray(T)
+
+    xmin, ymin = V.min(axis=0)
+    xmax, ymax = V.max(axis=0)
+
+    xs = jnp.linspace(xmin, xmax, res)
+    ys = jnp.linspace(ymin, ymax, res)
+    X, Y = jnp.meshgrid(xs, ys)
+
+    pts = jnp.stack([X.ravel(), Y.ravel()], axis=1)
+
+    # --- point-in-mesh mask (still NumPy, totally fine) ---
+    mask = jnp.zeros(len(pts), dtype=bool)
+    for tri in T:
+        poly = Path(V[tri])
+        mask |= poly.contains_points(pts)
+
+    # --- JAX model eval ---
+    pts_jax = jnp.array(pts)
+
+    # optional: jit + batch
+    model_apply_jit = jax.vmap(jax.jit(model_apply), in_axes=(None, 0))
+
+    Z = model_apply_jit(params, pts_jax)
+    Z = jnp.asarray(Z)  # back to numpy for plotting
+
+    # mask outside mesh
+    Z = Z.at[~mask].set(jnp.nan)
+    Z = Z.reshape(res, res)
+    mask = jnp.isnan(Z)
+    Z = jnp.where(mask, 0.0, Z)
+    # Z = jnp.ma.array(Z, mask=jnp.isnan(Z))
+
+    plt.figure()
+    plt.contour(X, Y, Z, levels=levels, linewidths=1.0)
+
+    # mesh outline
+    plt.triplot(V[:, 0], V[:, 1], T, color="k", alpha=0.2, linewidth=0.5)
+
+    plt.axis("equal")
+    plt.xlim(xmin, xmax)
+    plt.ylim(ymin, ymax)
+    plt.show()
+
+def generate_mesh(res_multiplier_range=(0.5, 1), key=jax.random.PRNGKey(3)):
     """
     Generate a random mesh. 
     :param key: JAX random key for reproducibility
     :return: V, T where V is a list of vertices and T is a list of triangles (as indices into V)
     """
 
-    W = 9
-    H = 9
+    W, H = 40, 40
+
     key, subkey = jax.random.split(key)
-    grid = jittered_grid((15, 15), (W, H), key=subkey)
+    res = jnp.array([W, H]) * jax.random.uniform(subkey, (), minval=res_multiplier_range[0], maxval=res_multiplier_range[1])
+    res = res.astype(int)
+    
+
+    key, subkey = jax.random.split(key)
+    grid = jittered_grid(res, (W, H), key=subkey)
     tris = jnp.array(mtri.Triangulation(grid[:, 0], grid[:, 1]).triangles, dtype=jnp.int32)
 
     # mask out certain grid points to create a more interesting shape
@@ -215,7 +289,7 @@ def generate_mesh(key=jax.random.PRNGKey(3)):
 
     # Flood fill to remove disjoint pieces and reindex vertices
 
-    _, adjacency_list = generate_mesh_dual(grid, tris)
+    _, _, adjacency_list = generate_mesh_dual(grid, tris)
 
     vertex_indices = jnp.full(len(grid), -1, dtype=jnp.int32)
     vertex_indices_inverse = jnp.full(len(grid), -1, dtype=jnp.int32)
@@ -246,6 +320,32 @@ def generate_mesh(key=jax.random.PRNGKey(3)):
 
     return V, T
 
-V, T = generate_mesh()
-centroids, adjacency_list = generate_mesh_dual(V, T)
-plot_primal_dual(V, T, centroids, adjacency_list)
+def sample_mesh(V, T, values, num_samples, key=jax.random.PRNGKey(0)):
+    """
+    Sample points uniformly from the mesh defined by vertices V and triangles T.
+    :param V: List of vertices
+    :param T: List of triangles (as indices into V)
+    :param values: List of values at each triangle
+    :param num_samples: Number of points to sample
+    :param key: JAX random key for reproducibility
+    :return: sampled_points, sampled_values where sampled_points is a list of points sampled from the mesh and sampled_values is a list of values corresponding to the triangle each point was sampled froms
+    """
+    areas = jax.vmap(lambda tri: triangle_area(V[tri]))(T)
+    probabilities = areas / jnp.sum(areas)
+
+    key, subkey = jax.random.split(key)
+    triangle_indices = jax.random.choice(subkey, len(T), shape=(num_samples,), p=probabilities)
+
+    def sample_point(tri):
+        v0, v1, v2 = V[tri]
+        r1 = jax.random.uniform(key)
+        r2 = jax.random.uniform(key)
+        sqrt_r1 = jnp.sqrt(r1)
+        return (1 - sqrt_r1) * v0 + sqrt_r1 * (1 - r2) * v1 + sqrt_r1 * r2 * v2
+
+    sampled_points = jax.vmap(sample_point)(T[triangle_indices])
+    sampled_values = values[triangle_indices]
+    return sampled_points, sampled_values
+
+def angle_to_vector(angle):
+    return jnp.array([jnp.cos(angle), jnp.sin(angle)])
